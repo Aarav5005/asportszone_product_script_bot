@@ -14,10 +14,14 @@ import re
 import schedule
 import os
 from dotenv import load_dotenv
+import logging
 
 import requests
 import telebot
 from groq import Groq
+
+# Suppress TeleBot logging noise
+logging.getLogger("telebot").setLevel(logging.WARNING)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -510,19 +514,29 @@ if __name__ == "__main__":
     log("✅", f"Store: {SHOPIFY_STORE}")
     log("✅", f"Allowed users: {ALLOWED_USERNAMES}")
     log("✅", f"Timeout: {GROUP_TIMEOUT_SECONDS}s")
-    log("✅", f"Bot: t.me/products_adding_Bot")
 
     threading.Thread(target=timeout_checker, daemon=True).start()
     threading.Thread(target=send_daily_report, daemon=True).start()
 
-    log("✅", "Bot is running. Send messages to t.me/products_adding_Bot")
+    log("✅", "Bot is running. Send messages to Telegram...")
     
     # 24/7 operation with auto-reconnection
+    retry_count = 0
     while True:
         try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+            retry_count = 0
+            log("✅", "Polling started...")
+            bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
+        except KeyboardInterrupt:
+            log("⏹", "Bot stopped by user")
+            break
         except Exception as e:
-            log("✗", f"Bot disconnected: {e}")
-            log("⏳", "Reconnecting in 15 seconds...")
-            time.sleep(15)
-            log("🔄", "Attempting to reconnect...")
+            retry_count += 1
+            log("✗", f"Connection error: {type(e).__name__}")
+            if retry_count > 50:
+                log("✗", f"Too many retries, sleeping 60s...")
+                time.sleep(60)
+                retry_count = 0
+            else:
+                time.sleep(5)
+            log("🔄", f"Reconnecting... (attempt {retry_count})")
