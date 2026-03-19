@@ -26,7 +26,7 @@ daily_products_added = []
 
 # ─── CONFIG (Load from Environment Variables) ─────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USERNAMES = os.getenv("ALLOWED_USERNAMES", "Aarav5005,Asportszone").split(",")
+ALLOWED_USERNAMES = os.getenv("ALLOWED_USERNAMES", "Aarav5005,Asportszone,asportszone22").split(",")
 ALLOWED_USERNAMES = [u.strip() for u in ALLOWED_USERNAMES]
 
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
