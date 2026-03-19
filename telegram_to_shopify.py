@@ -19,6 +19,7 @@ import logging
 import requests
 import telebot
 from groq import Groq
+from telebot.apihelper import ApiTelegramException
 
 # Suppress TeleBot logging noise
 logging.getLogger("telebot").setLevel(logging.WARNING)
@@ -515,6 +516,23 @@ if __name__ == "__main__":
     log("✅", f"Allowed users: {ALLOWED_USERNAMES}")
     log("✅", f"Timeout: {GROUP_TIMEOUT_SECONDS}s")
 
+    # Validate bot token early so startup errors are explicit.
+    try:
+        me = bot.get_me()
+        log("✅", f"Telegram bot authenticated: @{me.username}")
+    except ApiTelegramException as e:
+        desc = getattr(e, "description", str(e))
+        code = getattr(e, "error_code", "unknown")
+        log("✗", f"Telegram auth failed ({code}): {desc}")
+        raise SystemExit(1)
+
+    # Long polling should not use webhooks; clear any webhook from previous setups.
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        log("✅", "Webhook cleared for long polling mode")
+    except Exception as e:
+        log("⚠", f"Could not clear webhook: {e}")
+
     threading.Thread(target=timeout_checker, daemon=True).start()
     threading.Thread(target=send_daily_report, daemon=True).start()
 
@@ -524,15 +542,32 @@ if __name__ == "__main__":
     retry_count = 0
     while True:
         try:
-            retry_count = 0
             log("✅", "Polling started...")
             bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
+            retry_count = 0
         except KeyboardInterrupt:
             log("⏹", "Bot stopped by user")
             break
+        except ApiTelegramException as e:
+            retry_count += 1
+            desc = getattr(e, "description", str(e))
+            code = getattr(e, "error_code", "unknown")
+            log("✗", f"Telegram API error ({code}): {desc}")
+
+            # 409 usually means another instance is polling this same bot token.
+            if str(code) == "409" or "terminated by other getUpdates request" in str(desc):
+                log("⚠", "Conflict detected: another bot instance is active. Stop other instance and retry.")
+
+            if retry_count > 50:
+                log("✗", "Too many retries, sleeping 60s...")
+                time.sleep(60)
+                retry_count = 0
+            else:
+                time.sleep(5)
+            log("🔄", f"Reconnecting... (attempt {retry_count})")
         except Exception as e:
             retry_count += 1
-            log("✗", f"Connection error: {type(e).__name__}")
+            log("✗", f"Connection error: {type(e).__name__}: {e}")
             if retry_count > 50:
                 log("✗", f"Too many retries, sleeping 60s...")
                 time.sleep(60)
