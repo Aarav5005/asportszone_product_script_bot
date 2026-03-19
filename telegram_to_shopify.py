@@ -28,6 +28,7 @@ logging.getLogger("telebot").setLevel(logging.WARNING)
 load_dotenv()
 
 daily_products_added = []
+known_chat_ids = set()
 
 # ─── CONFIG (Load from Environment Variables) ─────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -91,11 +92,17 @@ def is_allowed(message) -> bool:
     return username.lower() in [u.lower() for u in ALLOWED_USERNAMES]
 
 
+def remember_chat_id(message) -> None:
+    if is_allowed(message):
+        known_chat_ids.add(message.chat.id)
+
+
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     if not is_allowed(message):
         bot.reply_to(message, "❌ Not authorized.")
         return
+    remember_chat_id(message)
     bot.reply_to(message, "✅ Bot ready! Send product caption + images to create Shopify listings.")
 
 
@@ -103,6 +110,7 @@ def handle_start(message):
 def handle_flush(message):
     if not is_allowed(message):
         return
+    remember_chat_id(message)
     chat_id = message.chat.id
     with buffers_lock:
         buf = product_buffers.pop(chat_id, None)
@@ -117,6 +125,7 @@ def handle_flush(message):
 def handle_status(message):
     if not is_allowed(message):
         return
+    remember_chat_id(message)
     chat_id = message.chat.id
     with buffers_lock:
         buf = product_buffers.get(chat_id)
@@ -135,6 +144,7 @@ def handle_status(message):
 def handle_text(message):
     if not is_allowed(message):
         return
+    remember_chat_id(message)
     chat_id = message.chat.id
     username = message.from_user.username or ""
     text = message.text.strip()
@@ -155,6 +165,7 @@ def handle_text(message):
 def handle_photo(message):
     if not is_allowed(message):
         return
+    remember_chat_id(message)
     chat_id = message.chat.id
     username = message.from_user.username or ""
 
@@ -474,13 +485,9 @@ def send_daily_report():
         report += f"✅ Products added today: {len(daily_products_added)}\n\n"
         for i, p in enumerate(daily_products_added, 1):
             report += f"{i}. {p['title']} — ₹{p['price']}\n"
-        for username in ALLOWED_USERNAMES:
+        for chat_id in list(known_chat_ids):
             try:
-                results = bot.get_updates()
-                for update in results:
-                    if update.message and update.message.from_user.username == username:
-                        bot.send_message(update.message.chat.id, report)
-                        break
+                bot.send_message(chat_id, report)
             except:
                 pass
         daily_products_added.clear()
