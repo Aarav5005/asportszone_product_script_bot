@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python telegram_to_shopify.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
