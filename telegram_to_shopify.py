@@ -230,12 +230,26 @@ def fetch_brand_images(product_title: str) -> list:
 def download_image_from_url(url: str, idx: int) -> dict:
     """Download image from URL and return base64 payload for Shopify."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://www.google.com/"
     }
-    response = requests.get(url, headers=headers, timeout=30)
+    response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
     response.raise_for_status()
+
+    # Validate it's actually an image
+    content_type = response.headers.get("content-type", "")
+    if not any(t in content_type.lower() for t in ["image", "jpeg", "jpg", "png", "webp"]):
+        raise ValueError(f"Not an image: {content_type}")
+
+    # Validate minimum size (at least 5KB)
+    if len(response.content) < 5000:
+        raise ValueError(f"Image too small: {len(response.content)} bytes")
+
     encoded = base64.b64encode(response.content).decode("ascii")
-    ext = url.split(".")[-1].split("?")[0] or "jpg"
+    ext = url.split(".")[-1].split("?")[0].lower()
+    if ext not in ["jpg", "jpeg", "png", "webp"]:
+        ext = "jpg"
     return {
         "attachment": encoded,
         "filename": f"product-image-{idx}.{ext}"
@@ -331,10 +345,15 @@ def process_buffer(buf: ProductBuffer):
             for idx, url in enumerate(image_urls, 1):
                 try:
                     payload = download_image_from_url(url, idx)
-                    image_payloads.append(payload)
-                    log("✅", f"Downloaded online image {idx}")
+                    # Validate image data before adding
+                    if payload and payload.get("attachment") and len(payload["attachment"]) > 100:
+                        image_payloads.append(payload)
+                        log("✅", f"Downloaded online image {idx}")
+                    else:
+                        log("✗", f"Image {idx} too small or invalid, skipping")
                 except Exception as e:
                     log("✗", f"Failed to download online image {idx}: {e}")
+                    continue
         else:
             bot.send_message(chat_id, "⚠️ Could not find images online. Creating listing without images.")
 
