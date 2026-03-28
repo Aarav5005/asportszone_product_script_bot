@@ -3,6 +3,7 @@ pip install pytelegrambotapi requests groq schedule python-dotenv
 """
 
 import base64
+import io
 import json
 import threading
 import time
@@ -15,6 +16,8 @@ import schedule
 import os
 from dotenv import load_dotenv
 import logging
+from PIL import Image
+from rembg import remove
 
 import requests
 import telebot
@@ -29,6 +32,7 @@ load_dotenv()
 
 daily_products_added = []
 known_chat_ids = set()
+daily_report_lock = threading.Lock()  # Protect shared state access
 
 # ─── CONFIG (Load from Environment Variables) ─────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -39,14 +43,16 @@ SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+TARGET_PUBLICATIONS = [
+    p.strip() for p in os.getenv("TARGET_PUBLICATIONS", "Online Store,Asports Zone Headless,Asports Zone Headless 03").split(",") if p.strip()
+]
 
 GROUP_TIMEOUT_SECONDS = int(os.getenv("GROUP_TIMEOUT_SECONDS", "180"))
 
 # Validate required variables
-if not all([TELEGRAM_BOT_TOKEN, SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GROQ_API_KEY, SERPAPI_KEY]):
+if not all([TELEGRAM_BOT_TOKEN, SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GROQ_API_KEY]):
     print("ERROR: Missing required environment variables!")
-    print("Please set: TELEGRAM_BOT_TOKEN, SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GROQ_API_KEY, SERPAPI_KEY")
+    print("Please set: TELEGRAM_BOT_TOKEN, SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GROQ_API_KEY")
     exit(1)
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -54,6 +60,7 @@ bot = Bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 SHOPIFY_PRODUCTS_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
+SHOPIFY_GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01/graphql.json"
 
 buffers_lock = threading.Lock()
 
@@ -191,69 +198,133 @@ def handle_photo(message):
 
 # ─── PROCESS BUFFER → SHOPIFY ─────────────────────────────────────────────────
 
-def fetch_brand_images(product_title: str) -> list:
-    """Fetch product images using SerpApi Google Image Search."""
-
-    log("🔍", f"Searching images for: {product_title}")
+def process_uploaded_image(image_bytes: bytes, idx: int) -> dict:
+    """Remove background, center subject, and return Shopify image payload."""
+    if not image_bytes:
+        raise ValueError("Empty image bytes")
 
     try:
-        params = {
-            "engine": "google_images",
-            "q": product_title + " cricket bat product",
-            "api_key": SERPAPI_KEY,
-            "num": 5,
-            "safe": "active",
-        }
-
-        response = requests.get(
-            "https://serpapi.com/search.json",
-            params=params,
-            timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        images_results = data.get("images_results", [])
-        if not images_results:
-            log("✗", "No images found via SerpApi")
-            return []
-
-        image_urls = [img["original"] for img in images_results[:5] if "original" in img]
-        log("✅", f"Found {len(image_urls)} images via SerpApi")
-        return image_urls
-
+        no_bg_bytes = remove(image_bytes)
     except Exception as e:
-        log("✗", f"SerpApi image search error: {e}")
-        return []
+        log("⚠", f"Background removal failed for image {idx}, using original: {e}")
+        no_bg_bytes = image_bytes
 
+    with Image.open(io.BytesIO(no_bg_bytes)) as src:
+        rgba = src.convert("RGBA")
+        bbox = rgba.getbbox()
+        if bbox:
+            rgba = rgba.crop(bbox)
 
-def download_image_from_url(url: str, idx: int) -> dict:
-    """Download image from URL and return base64 payload for Shopify."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
-    }
-    response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-    response.raise_for_status()
+        w, h = rgba.size
+        side = int(max(w, h) * 1.2)
+        side = max(side, 1200)
 
-    # Validate it's actually an image
-    content_type = response.headers.get("content-type", "")
-    if not any(t in content_type.lower() for t in ["image", "jpeg", "jpg", "png", "webp"]):
-        raise ValueError(f"Not an image: {content_type}")
+        canvas = Image.new("RGBA", (side, side), (255, 255, 255, 0))
+        x = (side - w) // 2
+        y = (side - h) // 2
+        canvas.paste(rgba, (x, y), rgba)
 
-    # Validate minimum size (at least 5KB)
-    if len(response.content) < 5000:
-        raise ValueError(f"Image too small: {len(response.content)} bytes")
+        out = io.BytesIO()
+        canvas.save(out, format="PNG", optimize=True)
 
-    encoded = base64.b64encode(response.content).decode("ascii")
-    ext = url.split(".")[-1].split("?")[0].lower()
-    if ext not in ["jpg", "jpeg", "png", "webp"]:
-        ext = "jpg"
+    encoded = base64.b64encode(out.getvalue()).decode("ascii")
     return {
         "attachment": encoded,
-        "filename": f"product-image-{idx}.{ext}"
+        "filename": f"product-image-{idx}.png"
     }
+
+
+def get_publications() -> List[Dict[str, str]]:
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+    query = """
+    query GetPublications {
+      publications(first: 50) {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    response = requests.post(
+        SHOPIFY_GRAPHQL_URL,
+        headers=headers,
+        json={"query": query},
+        timeout=60
+    )
+    response.raise_for_status()
+    body = response.json()
+
+    if body.get("errors"):
+        raise RuntimeError(f"GraphQL publication query failed: {body['errors']}")
+
+    edges = body.get("data", {}).get("publications", {}).get("edges", [])
+    return [edge.get("node", {}) for edge in edges if edge.get("node")]
+
+
+def publish_product_to_channels(product_id: int) -> List[str]:
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    publications = get_publications()
+    selected_publications = []
+
+    # Match publications by exact name (case-insensitive)
+    target_names = {name.lower(): name for name in TARGET_PUBLICATIONS}
+    
+    for pub in publications:
+        pub_name = str(pub.get("name", "")).lower()
+        if pub_name in target_names:
+            selected_publications.append(pub)
+
+    if not selected_publications:
+        log("⚠", f"No matching publications found. Target channels: {TARGET_PUBLICATIONS}")
+        return []
+
+    mutation = """
+    mutation PublishToChannel($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+
+    publishable_id = f"gid://shopify/Product/{product_id}"
+    publication_input = [{"publicationId": pub["id"]} for pub in selected_publications if pub.get("id")]
+
+    response = requests.post(
+        SHOPIFY_GRAPHQL_URL,
+        headers=headers,
+        json={
+            "query": mutation,
+            "variables": {
+                "id": publishable_id,
+                "input": publication_input
+            }
+        },
+        timeout=60
+    )
+    response.raise_for_status()
+    body = response.json()
+
+    if body.get("errors"):
+        raise RuntimeError(f"GraphQL publish failed: {body['errors']}")
+
+    user_errors = body.get("data", {}).get("publishablePublish", {}).get("userErrors", [])
+    if user_errors:
+        raise RuntimeError(f"Publish userErrors: {user_errors}")
+
+    return [str(pub.get("name", "")) for pub in selected_publications]
 
 
 def check_duplicate_product(title: str) -> dict:
@@ -262,12 +333,17 @@ def check_duplicate_product(title: str) -> dict:
         "Content-Type": "application/json"
     }
     search_title = quote_plus(title[:50])
-    response = requests.get(
-        f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?title={search_title}&limit=5",
-        headers=headers,
-        timeout=30
-    )
-    products = response.json().get("products", [])
+    try:
+        response = requests.get(
+            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?title={search_title}&limit=5",
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        products = response.json().get("products", [])
+    except Exception as e:
+        log("⚠", f"Duplicate check failed (continuing anyway): {e}")
+        return {"duplicate": False}
     for product in products:
         existing_title = product.get("title", "").lower()
         new_title = title.lower()
@@ -297,6 +373,7 @@ def process_buffer(buf: ProductBuffer):
     # Step 1: Extract product details with Groq
     try:
         product_data = extract_product_with_groq(buf.caption)
+        product_data["raw_caption"] = buf.caption
     except Exception as e:
         log("✗", f"Groq error: {e}")
         bot.send_message(chat_id, f"❌ AI extraction failed: {e}")
@@ -315,47 +392,23 @@ def process_buffer(buf: ProductBuffer):
     # Step 2: Download images
     image_payloads = []
 
-    if buf.photo_file_ids:
-        # Use images sent via Telegram
-        log("🖼", f"Using {len(buf.photo_file_ids)} images from Telegram")
-        for idx, file_id in enumerate(buf.photo_file_ids, 1):
-            try:
-                log("🖼", f"Downloading image {idx}/{len(buf.photo_file_ids)}")
-                file_info = bot.get_file(file_id)
-                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
-                response = requests.get(file_url, timeout=45)
-                response.raise_for_status()
-                encoded = base64.b64encode(response.content).decode("ascii")
-                image_payloads.append({
-                    "attachment": encoded,
-                    "filename": f"product-image-{idx}.jpg"
-                })
-            except Exception as e:
-                log("✗", f"Image download error: {e}")
-    else:
-        # No images sent — auto fetch from brand website
-        log("🔍", f"No images sent. Auto-fetching from brand website...")
-        bot.send_message(chat_id, "🔍 No images sent. Searching brand website automatically...")
+    if not buf.photo_file_ids:
+        bot.send_message(chat_id, "❌ No images uploaded. Please send product images, then use /flush.")
+        return
 
-        title = product_data.get("title", "")
-        image_urls = fetch_brand_images(title)
-
-        if image_urls:
-            bot.send_message(chat_id, f"🖼 Found {len(image_urls)} images online. Downloading...")
-            for idx, url in enumerate(image_urls, 1):
-                try:
-                    payload = download_image_from_url(url, idx)
-                    # Validate image data before adding
-                    if payload and payload.get("attachment") and len(payload["attachment"]) > 100:
-                        image_payloads.append(payload)
-                        log("✅", f"Downloaded online image {idx}")
-                    else:
-                        log("✗", f"Image {idx} too small or invalid, skipping")
-                except Exception as e:
-                    log("✗", f"Failed to download online image {idx}: {e}")
-                    continue
-        else:
-            bot.send_message(chat_id, "⚠️ Could not find images online. Creating listing without images.")
+    log("🖼", f"Using {len(buf.photo_file_ids)} images from Telegram")
+    for idx, file_id in enumerate(buf.photo_file_ids, 1):
+        try:
+            log("🖼", f"Downloading image {idx}/{len(buf.photo_file_ids)}")
+            file_info = bot.get_file(file_id)
+            file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
+            response = requests.get(file_url, timeout=45)
+            response.raise_for_status()
+            payload = process_uploaded_image(response.content, idx)
+            image_payloads.append(payload)
+            log("✅", f"Image {idx} processed (background removed + centered)")
+        except Exception as e:
+            log("✗", f"Image processing error for #{idx}: {e}")
 
     if not image_payloads:
         bot.send_message(chat_id, "❌ Failed to download images.")
@@ -369,12 +422,22 @@ def process_buffer(buf: ProductBuffer):
         title = product.get("title", "Unknown")
         admin_url = f"https://{SHOPIFY_STORE}/admin/products/{product_id}"
 
+        published_channels = []
+        if product_id:
+            try:
+                published_channels = publish_product_to_channels(int(product_id))
+                if published_channels:
+                    log("✅", f"Published to channels: {', '.join(published_channels)}")
+            except Exception as publish_error:
+                log("⚠", f"Product created but publish step failed: {publish_error}")
+
         log("✅", f"Product created: {title} (ID: {product_id})")
-        daily_products_added.append({
-            "title": title,
-            "price": product_data.get("price", 0),
-            "id": product_id
-        })
+        with daily_report_lock:
+            daily_products_added.append({
+                "title": title,
+                "price": product_data.get("price", 0),
+                "id": product_id
+            })
         bot.send_message(chat_id,
             f"✅ Product created on Shopify!\n\n"
             f"📦 Title: {title}\n"
@@ -382,6 +445,7 @@ def process_buffer(buf: ProductBuffer):
             f"💸 Selling Price: ₹{product_data.get('price', 0)}\n"
             f"📊 Stock: 100\n"
             f"🖼 Images: {len(image_payloads)}\n\n"
+            f"📡 Published To: {', '.join(published_channels) if published_channels else 'Default channel only'}\n\n"
             f"🔗 {admin_url}"
         )
     except Exception as e:
@@ -399,6 +463,7 @@ def extract_product_with_groq(caption: str) -> Dict[str, Any]:
         "Extract product details from the message below and return ONLY valid JSON. "
         "No markdown, no code fences, no extra text. "
         "Fields required: title, description, price, mrp, quantity, vendor, sku, sizes. "
+        "User may only send title + MRP + selling price, so infer missing non-critical fields safely. "
         "sizes: array of sizes mentioned (e.g. ['4','5','6','SH','Harrow']). "
         "If no sizes mentioned use ['4','5','6','SH'] as default for bats, "
         "['S','M','L','XL'] for clothing, [] for others. "
@@ -406,7 +471,9 @@ def extract_product_with_groq(caption: str) -> Dict[str, Any]:
         "- price = the Selling or Selling Price value (number only) "
         "- mrp = the MRP value (number only) "
         "- quantity = always 100, ignore any number in the message "
-        "- description = 'MRP: ₹[mrp value] | Selling Price: ₹[price value]' "
+        "- description must be 3-5 short sales lines in plain text for Shopify, "
+        "  including product highlights and use case, then a final price line like "
+        "  'MRP: ₹[mrp] | Selling Price: ₹[price]' "
         "- vendor = brand name if mentioned, else Supplier "
         "- sku = product code if mentioned, else empty string "
         "price and mrp must be numbers, quantity must be integer 100.\n\n"
@@ -430,12 +497,110 @@ def extract_product_with_groq(caption: str) -> Dict[str, Any]:
     end = content.rfind("}")
     parsed = json.loads(content[start:end+1])
 
-    for f in ["title", "description", "price", "quantity", "vendor", "sku"]:
+    for f in ["title", "description", "price", "mrp", "quantity", "vendor", "sku", "sizes"]:
         if f not in parsed:
-            parsed[f] = "" if f not in ["price", "quantity"] else 0
+            if f in ["price", "mrp", "quantity"]:
+                parsed[f] = 0
+            elif f == "sizes":
+                parsed[f] = []
+            else:
+                parsed[f] = ""
+
+    # Safety fallback: ensure there is always a useful auto-generated description.
+    description_text = str(parsed.get("description", "")).strip()
+    if len(description_text) < 25:
+        title = str(parsed.get("title", "This product")).strip() or "This product"
+        vendor = str(parsed.get("vendor", "Supplier")).strip() or "Supplier"
+        mrp = int(float(parsed.get("mrp", 0) or 0))
+        price = int(float(parsed.get("price", 0) or 0))
+        parsed["description"] = (
+            f"{title} by {vendor} is built for reliable daily performance.\n"
+            f"Designed for comfort, control, and long-lasting use.\n"
+            f"A strong choice for training sessions and match play.\n"
+            f"MRP: ₹{mrp} | Selling Price: ₹{price}"
+        )
 
     log("✅", f"Extracted: {parsed.get('title')} — ₹{parsed.get('price')}")
     return parsed
+
+
+def normalize_sizes(raw_sizes: Any, title: str, caption: str) -> List[str]:
+    """Normalize size values from AI/user text to clean Shopify variant values."""
+    normalized: List[str] = []
+
+    if isinstance(raw_sizes, list):
+        candidates = [str(s).strip() for s in raw_sizes if str(s).strip()]
+    elif isinstance(raw_sizes, str):
+        candidates = [s.strip() for s in re.split(r"[,/|]", raw_sizes) if s.strip()]
+    else:
+        candidates = []
+
+    text = f"{title} {caption}".lower()
+
+    # Strong signal: explicit user input like "size 7" should take priority.
+    explicit_sizes_from_text = re.findall(r"\bsize\s*([0-9]{1,2})\b", text)
+    explicit_named_sizes = []
+    if re.search(r"\bfull\s*size\b|\bshort\s*handle\b|\bsh\b", text):
+        explicit_named_sizes.append("SH")
+    if re.search(r"\bharrow\b", text):
+        explicit_named_sizes.append("Harrow")
+    if explicit_sizes_from_text or explicit_named_sizes:
+        candidates = [*explicit_sizes_from_text, *explicit_named_sizes]
+
+    # Common cricket bat size aliases.
+    alias_map = {
+        "full size": "SH",
+        "full": "SH",
+        "short handle": "SH",
+        "short-handle": "SH",
+        "size 7": "7",
+        "size 6": "6",
+        "size 5": "5",
+        "size 4": "4",
+        "harrow": "Harrow",
+    }
+
+    for c in candidates:
+        key = c.lower().strip()
+        normalized.append(alias_map.get(key, c.strip()))
+
+    # Fallback detect from caption/title when model misses sizes.
+    if not normalized:
+        if re.search(r"\bsize\s*7\b", text):
+            normalized.append("7")
+        if re.search(r"\bfull\s*size\b|\bshort\s*handle\b|\bsh\b", text):
+            normalized.append("SH")
+        if re.search(r"\bharrow\b", text):
+            normalized.append("Harrow")
+        if re.search(r"\bsize\s*6\b|\b6\b", text):
+            normalized.append("6")
+        if re.search(r"\bsize\s*5\b|\b5\b", text):
+            normalized.append("5")
+        if re.search(r"\bsize\s*4\b|\b4\b", text):
+            normalized.append("4")
+
+    # De-duplicate while preserving order.
+    deduped: List[str] = []
+    seen = set()
+    for size in normalized:
+        size_clean = str(size).strip()
+        if not size_clean:
+            continue
+        size_key = size_clean.lower()
+        if size_key in seen:
+            continue
+        seen.add(size_key)
+        deduped.append(size_clean)
+
+    # Keep existing defaults if still nothing found.
+    if deduped:
+        return deduped
+
+    if any(k in text for k in ["bat", "cricket"]):
+        return ["4", "5", "6", "SH"]
+    if any(k in text for k in ["tshirt", "t-shirt", "jersey", "hoodie", "track pant", "clothing"]):
+        return ["S", "M", "L", "XL"]
+    return []
 
 
 # ─── SHOPIFY PRODUCT CREATION ─────────────────────────────────────────────────
@@ -466,7 +631,11 @@ def create_shopify_product(product_data: Dict, image_payloads: List) -> Dict:
         }
     }
 
-    sizes = product_data.get("sizes", [])
+    sizes = normalize_sizes(
+        product_data.get("sizes", []),
+        str(product_data.get("title", "")),
+        str(product_data.get("raw_caption", ""))
+    )
     if sizes and len(sizes) > 0:
         variants = []
         for size in sizes:
@@ -501,15 +670,16 @@ def send_daily_report():
         if not daily_products_added:
             return
         report = f"📊 Daily Report — {datetime.now().strftime('%d %b %Y')}\n\n"
-        report += f"✅ Products added today: {len(daily_products_added)}\n\n"
-        for i, p in enumerate(daily_products_added, 1):
-            report += f"{i}. {p['title']} — ₹{p['price']}\n"
-        for chat_id in list(known_chat_ids):
-            try:
-                bot.send_message(chat_id, report)
-            except:
-                pass
-        daily_products_added.clear()
+        with daily_report_lock:
+            report += f"✅ Products added today: {len(daily_products_added)}\n\n"
+            for i, p in enumerate(daily_products_added, 1):
+                report += f"{i}. {p['title']} — ₹{p['price']}\n"
+            for chat_id in list(known_chat_ids):
+                try:
+                    bot.send_message(chat_id, report)
+                except:
+                    pass
+            daily_products_added.clear()
 
     schedule.every().day.at("21:00").do(report_job)
     while True:
@@ -538,6 +708,16 @@ def timeout_checker():
 
 if __name__ == "__main__":
     log("✅", f"Telegram Bot starting...")
+
+    # Pre-download rembg model to cache it (avoids timeout on first image processing)
+    try:
+        log("📦", "Pre-downloading rembg AI model (this may take 1-2 min on first run)...")
+        from rembg import new_session
+        session = new_session()
+        log("✅", "rembg model cached successfully")
+    except Exception as e:
+        log("⚠", f"rembg pre-download warning (will retry on first use): {e}")
+
     log("✅", f"Store: {SHOPIFY_STORE}")
     log("✅", f"Allowed users: {ALLOWED_USERNAMES}")
     log("✅", f"Timeout: {GROUP_TIMEOUT_SECONDS}s")
